@@ -1,4 +1,4 @@
-// api/tally-webhook.js (CommonJS, raw-body verification)
+// api/tally-webhook.js (CommonJS, raw-body verify, smarter parsing)
 const crypto = require('crypto');
 
 module.exports = async (req, res) => {
@@ -7,46 +7,43 @@ module.exports = async (req, res) => {
   }
 
   const secret = process.env.TALLY_SIGNING_SECRET;
-  const skipVerify = process.env.SKIP_TALLY_VERIFY === '1'; // optional bypass
+  const debug = process.env.DEBUG_TALLY === '1';
 
   try {
-    // 1) Read RAW body as sent by Tally
+    // 1) Read RAW body exactly as Tally sent it
     const rawBuf = await readRawBody(req);
     const raw = rawBuf.toString('utf8');
 
-    // 2) Verify signature (unless bypassed)
-    if (secret && !skipVerify) {
-      const ok = verifyTallySignature(raw, req.headers['tally-signature'], secret);
-      if (!ok) {
-        console.error('❌ Invalid Tally signature');
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
+    // 2) Signature verification (required)
+    if (!secret) {
+      console.error("Missing TALLY_SIGNING_SECRET");
+      return res.status(500).json({ error: "Server not configured" });
+    }
+    const sigHeader = req.headers['tally-signature'];
+    if (!verifyTallySignature(raw, sigHeader, secret)) {
+      console.error("❌ Invalid Tally signature");
+      if (debug) console.log("tally-signature:", sigHeader, "rawPreview:", raw.slice(0, 150));
+      return res.status(401).json({ error: "Invalid signature" });
     }
 
-    // 3) Parse JSON only AFTER verification
+    // 3) Parse AFTER verifying
     const body = JSON.parse(raw);
     const fields = body?.data?.fields || [];
 
-    const byLabel = (label) =>
-      fields.find(x => (x.label || '').toLowerCase() === label.toLowerCase())?.value ?? null;
-    const firstOfType = (type) =>
-      fields.find(x => x.type === type)?.value ?? null;
+    // --- Extract values ---
+    const email = getEmail(fields);
+    const firstName = getFirstName(fields);
+    let archetype = getArchetype(fields) || computeArchetypeFromScores(fields);
 
-    const email =
-      byLabel('Email') || firstOfType('INPUT_EMAIL') || firstOfType('EMAIL') || null;
+    if (debug) console.log({ email, firstName, archetype });
 
-    const firstName =
-      byLabel('First name') || byLabel('First Name') || byLabel('Name') || firstOfType('INPUT_TEXT') || undefined;
-
-    const archetype =
-      byLabel('Archetype') || byLabel('Type') || byLabel('Result') || firstOfType('CALCULATED_FIELDS') || undefined;
-
+    // 4) If no email, return 200 (so Tally is green) but skip ML
     if (!email) {
-      console.error('Missing email in payload');
-      return res.status(400).json({ ok: false, error: 'Missing email' });
+      console.warn("No email found in submission; skipping MailerLite.");
+      return res.status(200).json({ ok: false, reason: "missing_email", archetype });
     }
 
-    // ---- MailerLite ----
+    // 5) Push to MailerLite
     const ML_API = process.env.MAILERLITE_API_KEY;
     const ML_GROUP = process.env.MAILERLITE_GROUP_ID;
     if (!ML_API || !ML_GROUP) {
@@ -57,7 +54,7 @@ module.exports = async (req, res) => {
     const endpoint = 'https://connect.mailerlite.com/api/subscribers';
     const payload = {
       email,
-      fields: { name: firstName, archetype, source: 'tally' },
+      fields: { name: firstName || undefined, archetype: archetype || undefined, source: 'tally' },
       groups: [ML_GROUP],
       resubscribe: true,
       autoresponders: true
@@ -78,29 +75,22 @@ module.exports = async (req, res) => {
 
     if (!mlRes.ok) {
       console.error('MailerLite error:', mlRes.status, data);
+      // Still 200 so Tally doesn't keep retrying
       return res.status(200).json({ ok: false, mailerlite_status: mlRes.status, error: data });
     }
 
-    return res.status(200).json({
-      ok: true,
-      subscribed: { email, group: ML_GROUP },
-      mailerlite: data
-    });
+    return res.status(200).json({ ok: true, subscribed: { email, group: ML_GROUP }, mailerlite: data });
   } catch (e) {
     console.error('Webhook error:', e);
     return res.status(400).json({ ok: false, error: 'Handler error' });
   }
 };
 
-// ---- Helpers ----
+// ---------- Helpers ----------
 function readRawBody(req) {
-  // Try several places; fall back to stream
-  if (req.rawBody) {
-    return Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
-  }
+  if (req.rawBody) return Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
   if (typeof req.body === 'string') return Buffer.from(req.body);
   if (Buffer.isBuffer(req.body)) return req.body;
-
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
@@ -113,17 +103,86 @@ function verifyTallySignature(raw, signatureHeader, secret) {
   if (!signatureHeader) return false;
   // header: "t=timestamp,v1=signature"
   const parts = Object.fromEntries(signatureHeader.split(',').map(s => s.split('=')));
-  const t = parts.t;
-  const v1 = parts.v1;
+  const t = parts.t, v1 = parts.v1;
   if (!t || !v1) return false;
+  const expected = crypto.createHmac('sha256', secret).update(`${t}.${raw}`).digest('hex');
+  try { return crypto.timingSafeEqual(Buffer.from(v1), Buffer.from(expected)); }
+  catch { return false; }
+}
 
-  const expected = crypto.createHmac('sha256', secret)
-    .update(`${t}.${raw}`)
-    .digest('hex');
+// --- Parsers ---
+function getEmail(fields) {
+  // exact email field by type
+  const t = fields.find(f => f.type === 'INPUT_EMAIL' && f.value);
+  if (t) return String(t.value).trim();
 
-  try {
-    return crypto.timingSafeEqual(Buffer.from(v1), Buffer.from(expected));
-  } catch {
-    return false;
+  // any label containing "email"
+  const byLabel = fields.find(f => /email/i.test(f.label || '') && f.value);
+  if (byLabel) return String(byLabel.value).trim();
+
+  // Tally payment block often has "Payment (email)" with type PAYMENT
+  const payEmail = fields.find(f => f.type === 'PAYMENT' && /email/i.test(f.label || '') && f.value);
+  if (payEmail) return String(payEmail.value).trim();
+
+  // last chance: text field that looks like an email
+  const emailish = fields.find(f =>
+    (f.type === 'INPUT_TEXT' || f.type === 'TEXTAREA') &&
+    typeof f.value === 'string' &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(f.value)
+  );
+  if (emailish) return emailish.value.trim();
+
+  return null;
+}
+
+function getFirstName(fields) {
+  const names = [
+    'First name', 'First Name', 'Vorname', 'Name', 'first_name', 'first name'
+  ];
+  for (const n of names) {
+    const f = fields.find(x => (x.label || '').toLowerCase() === n.toLowerCase() && x.value);
+    if (f) return String(f.value).trim();
   }
+  // Payment (name) fallback
+  const payName = fields.find(f => f.type === 'PAYMENT' && /name/i.test(f.label || '') && f.value);
+  if (payName) return String(payName.value).trim();
+  return undefined;
+}
+
+function getArchetype(fields) {
+  const keys = ['Archetype', 'Type', 'Result'];
+  for (const k of keys) {
+    const f = fields.find(x => (x.label || '').toLowerCase() === k.toLowerCase() && x.value);
+    if (f) return String(f.value).trim();
+  }
+  return undefined;
+}
+
+function computeArchetypeFromScores(fields) {
+  // expects labels like score_scroller, score_binger, ...
+  const scoreFields = fields.filter(f =>
+    f.type === 'CALCULATED_FIELDS' &&
+    typeof f.value === 'number' &&
+    /^score_/.test(f.label || '')
+  );
+  if (!scoreFields.length) return undefined;
+
+  const map = {
+    score_scroller: 'Scroller',
+    score_binger: 'Binger',
+    score_escapist: 'Escapist',
+    score_juggler: 'Juggler',
+    score_overthinker: 'Overthinker',
+    score_chaser: 'Chaser',
+    score_muted: 'Muted',
+    score_none: 'None'
+  };
+
+  let best = null;
+  for (const f of scoreFields) {
+    const key = (f.label || '').toLowerCase();
+    if (!map[key]) continue;
+    if (!best || f.value > best.value) best = { label: map[key], value: f.value };
+  }
+  return best?.label;
 }
