@@ -1,3 +1,4 @@
+// api/tally-webhook.js (CommonJS, raw-body verification)
 const crypto = require('crypto');
 
 module.exports = async (req, res) => {
@@ -5,22 +6,25 @@ module.exports = async (req, res) => {
     return res.status(200).json({ message: "Webhook is live ✅, but use POST" });
   }
 
+  const secret = process.env.TALLY_SIGNING_SECRET;
+  const skipVerify = process.env.SKIP_TALLY_VERIFY === '1'; // optional bypass
+
   try {
-    const secret = process.env.TALLY_SIGNING_SECRET;
-    if (!secret) {
-      console.error("Missing TALLY_SIGNING_SECRET");
-      return res.status(500).json({ error: "Server not configured" });
+    // 1) Read RAW body as sent by Tally
+    const rawBuf = await readRawBody(req);
+    const raw = rawBuf.toString('utf8');
+
+    // 2) Verify signature (unless bypassed)
+    if (secret && !skipVerify) {
+      const ok = verifyTallySignature(raw, req.headers['tally-signature'], secret);
+      if (!ok) {
+        console.error('❌ Invalid Tally signature');
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
     }
 
-    const signatureHeader = req.headers['tally-signature'];
-    const rawBody = JSON.stringify(req.body);
-
-    if (!verifyTallySignature(rawBody, signatureHeader, secret)) {
-      console.error("❌ Invalid Tally signature");
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
-    const body = req.body;
+    // 3) Parse JSON only AFTER verification
+    const body = JSON.parse(raw);
     const fields = body?.data?.fields || [];
 
     const byLabel = (label) =>
@@ -38,10 +42,11 @@ module.exports = async (req, res) => {
       byLabel('Archetype') || byLabel('Type') || byLabel('Result') || firstOfType('CALCULATED_FIELDS') || undefined;
 
     if (!email) {
-      console.error('Missing email in payload:', JSON.stringify(body));
+      console.error('Missing email in payload');
       return res.status(400).json({ ok: false, error: 'Missing email' });
     }
 
+    // ---- MailerLite ----
     const ML_API = process.env.MAILERLITE_API_KEY;
     const ML_GROUP = process.env.MAILERLITE_GROUP_ID;
     if (!ML_API || !ML_GROUP) {
@@ -76,21 +81,49 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: false, mailerlite_status: mlRes.status, error: data });
     }
 
-    return res.status(200).json({ ok: true, subscribed: { email, group: ML_GROUP }, mailerlite: data });
+    return res.status(200).json({
+      ok: true,
+      subscribed: { email, group: ML_GROUP },
+      mailerlite: data
+    });
   } catch (e) {
-    console.error("Webhook error:", e);
-    return res.status(400).json({ ok: false, error: "Handler error" });
+    console.error('Webhook error:', e);
+    return res.status(400).json({ ok: false, error: 'Handler error' });
   }
 };
 
-function verifyTallySignature(payload, signatureHeader, secret) {
+// ---- Helpers ----
+function readRawBody(req) {
+  // Try several places; fall back to stream
+  if (req.rawBody) {
+    return Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
+  }
+  if (typeof req.body === 'string') return Buffer.from(req.body);
+  if (Buffer.isBuffer(req.body)) return req.body;
+
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function verifyTallySignature(raw, signatureHeader, secret) {
   if (!signatureHeader) return false;
-  const parts = signatureHeader.split(',');
-  const timestamp = parts[0].split('=')[1];
-  const signature = parts[1].split('=')[1];
-  const baseString = `${timestamp}.${payload}`;
-  const expected = require('crypto').createHmac('sha256', secret).update(baseString).digest('hex');
+  // header: "t=timestamp,v1=signature"
+  const parts = Object.fromEntries(signatureHeader.split(',').map(s => s.split('=')));
+  const t = parts.t;
+  const v1 = parts.v1;
+  if (!t || !v1) return false;
+
+  const expected = crypto.createHmac('sha256', secret)
+    .update(`${t}.${raw}`)
+    .digest('hex');
+
   try {
-    return require('crypto').timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch { return false; }
+    return crypto.timingSafeEqual(Buffer.from(v1), Buffer.from(expected));
+  } catch {
+    return false;
+  }
 }
