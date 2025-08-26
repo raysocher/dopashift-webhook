@@ -1,34 +1,37 @@
-// api/tally-webhook.js (CommonJS, raw-body verify, smarter parsing)
+// api/tally-webhook.js
+// CommonJS • Vercel Serverless
+// Env required (Production): TALLY_SIGNING_SECRET, MAILERLITE_API_KEY, MAILERLITE_GROUP_ID
 const crypto = require('crypto');
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    return res.status(200).json({ message: "Webhook is live ✅, but use POST" });
+    return res.status(200).json({ message: 'Webhook is live ✅, but use POST' });
   }
 
   const secret = process.env.TALLY_SIGNING_SECRET;
   const debug = process.env.DEBUG_TALLY === '1';
 
   try {
+    if (!secret) {
+      console.error('Missing TALLY_SIGNING_SECRET');
+      return res.status(500).json({ error: 'Server not configured' });
+    }
+
     // 1) Read RAW body exactly as Tally sent it
     const rawBuf = await readRawBody(req);
     const raw = rawBuf.toString('utf8');
 
-    // 2) Signature verification (required)
-    if (!secret) {
-      console.error("Missing TALLY_SIGNING_SECRET");
-      return res.status(500).json({ error: "Server not configured" });
-    }
+    // 2) Verify Tally signature (header: "t=timestamp,v1=hex")
     const sigHeader = req.headers['tally-signature'];
     if (!verifyTallySignature(raw, sigHeader, secret)) {
-      console.error("❌ Invalid Tally signature");
-      if (debug) console.log("tally-signature:", sigHeader, "rawPreview:", raw.slice(0, 150));
-      return res.status(401).json({ error: "Invalid signature" });
+      console.error('❌ Invalid Tally signature');
+      if (debug) console.log('tally-signature:', sigHeader, 'rawPreview:', raw.slice(0, 150));
+      return res.status(401).json({ error: 'Invalid signature' });
     }
 
     // 3) Parse AFTER verifying
     const body = JSON.parse(raw);
-    const fields = body?.data?.fields || [];
+    const fields = Array.isArray(body?.data?.fields) ? body.data.fields : [];
 
     // --- Extract values ---
     const email = getEmail(fields);
@@ -37,10 +40,10 @@ module.exports = async (req, res) => {
 
     if (debug) console.log({ email, firstName, archetype });
 
-    // 4) If no email, return 200 (so Tally is green) but skip ML
+    // 4) If no email, return 200 (so Tally is green) but skip MailerLite
     if (!email) {
-      console.warn("No email found in submission; skipping MailerLite.");
-      return res.status(200).json({ ok: false, reason: "missing_email", archetype });
+      console.warn('No email found in submission; skipping MailerLite.');
+      return res.status(200).json({ ok: false, reason: 'missing_email', archetype });
     }
 
     // 5) Push to MailerLite
@@ -54,7 +57,11 @@ module.exports = async (req, res) => {
     const endpoint = 'https://connect.mailerlite.com/api/subscribers';
     const payload = {
       email,
-      fields: { name: firstName || undefined, archetype: archetype || undefined, source: 'tally' },
+      fields: {
+        name: firstName || undefined,
+        archetype: archetype || undefined,
+        source: 'tally'
+      },
       groups: [ML_GROUP],
       resubscribe: true,
       autoresponders: true
@@ -63,9 +70,9 @@ module.exports = async (req, res) => {
     const mlRes = await fetch(endpoint, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${ML_API}`,
+        Authorization: `Bearer ${ML_API}`,
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        Accept: 'application/json'
       },
       body: JSON.stringify(payload)
     });
@@ -75,25 +82,32 @@ module.exports = async (req, res) => {
 
     if (!mlRes.ok) {
       console.error('MailerLite error:', mlRes.status, data);
-      // Still 200 so Tally doesn't keep retrying
+      // Still 200 so Tally doesn’t retry forever
       return res.status(200).json({ ok: false, mailerlite_status: mlRes.status, error: data });
     }
 
-    return res.status(200).json({ ok: true, subscribed: { email, group: ML_GROUP }, mailerlite: data });
+    return res.status(200).json({
+      ok: true,
+      subscribed: { email, group: ML_GROUP },
+      mailerlite: data
+    });
   } catch (e) {
     console.error('Webhook error:', e);
     return res.status(400).json({ ok: false, error: 'Handler error' });
   }
 };
 
-// ---------- Helpers ----------
+/* ----------------- Helpers ----------------- */
+
 function readRawBody(req) {
+  // Prefer rawBody if available, else reconstruct from stream
   if (req.rawBody) return Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
   if (typeof req.body === 'string') return Buffer.from(req.body);
   if (Buffer.isBuffer(req.body)) return req.body;
+
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    req.on('data', c => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
@@ -101,30 +115,41 @@ function readRawBody(req) {
 
 function verifyTallySignature(raw, signatureHeader, secret) {
   if (!signatureHeader) return false;
-  // header: "t=timestamp,v1=signature"
-  const parts = Object.fromEntries(signatureHeader.split(',').map(s => s.split('=')));
-  const t = parts.t, v1 = parts.v1;
-  if (!t || !v1) return false;
-  const expected = crypto.createHmac('sha256', secret).update(`${t}.${raw}`).digest('hex');
-  try { return crypto.timingSafeEqual(Buffer.from(v1), Buffer.from(expected)); }
-  catch { return false; }
+
+  // Robustly parse "t=...,v1=..."
+  const tMatch = /(?:^|,)\s*t=([^,]+)/.exec(signatureHeader);
+  const vMatch = /(?:^|,)\s*v1=([a-f0-9]+)/i.exec(signatureHeader);
+  if (!tMatch || !vMatch) return false;
+
+  const t = tMatch[1].trim();
+  const v1 = vMatch[1].trim();
+
+  const expectedHex = crypto.createHmac('sha256', secret)
+    .update(`${t}.${raw}`)
+    .digest('hex');
+
+  try {
+    // Compare as binary buffers of equal length
+    return crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expectedHex, 'hex'));
+  } catch {
+    return false;
+  }
 }
 
-// --- Parsers ---
 function getEmail(fields) {
-  // exact email field by type
+  // Exact email input
   const t = fields.find(f => f.type === 'INPUT_EMAIL' && f.value);
   if (t) return String(t.value).trim();
 
-  // any label containing "email"
+  // Label containing "email"
   const byLabel = fields.find(f => /email/i.test(f.label || '') && f.value);
   if (byLabel) return String(byLabel.value).trim();
 
-  // Tally payment block often has "Payment (email)" with type PAYMENT
+  // Payment block sometimes includes "Payment (email)"
   const payEmail = fields.find(f => f.type === 'PAYMENT' && /email/i.test(f.label || '') && f.value);
   if (payEmail) return String(payEmail.value).trim();
 
-  // last chance: text field that looks like an email
+  // Text field that looks like an email
   const emailish = fields.find(f =>
     (f.type === 'INPUT_TEXT' || f.type === 'TEXTAREA') &&
     typeof f.value === 'string' &&
@@ -136,22 +161,18 @@ function getEmail(fields) {
 }
 
 function getFirstName(fields) {
-  const names = [
-    'First name', 'First Name', 'Vorname', 'Name', 'first_name', 'first name'
-  ];
+  const names = ['First name', 'First Name', 'Vorname', 'Name', 'first_name', 'first name'];
   for (const n of names) {
     const f = fields.find(x => (x.label || '').toLowerCase() === n.toLowerCase() && x.value);
     if (f) return String(f.value).trim();
   }
-  // Payment (name) fallback
   const payName = fields.find(f => f.type === 'PAYMENT' && /name/i.test(f.label || '') && f.value);
   if (payName) return String(payName.value).trim();
   return undefined;
 }
 
 function getArchetype(fields) {
-  const keys = ['Archetype', 'Type', 'Result'];
-  for (const k of keys) {
+  for (const k of ['Archetype', 'Type', 'Result']) {
     const f = fields.find(x => (x.label || '').toLowerCase() === k.toLowerCase() && x.value);
     if (f) return String(f.value).trim();
   }
@@ -160,13 +181,6 @@ function getArchetype(fields) {
 
 function computeArchetypeFromScores(fields) {
   // expects labels like score_scroller, score_binger, ...
-  const scoreFields = fields.filter(f =>
-    f.type === 'CALCULATED_FIELDS' &&
-    typeof f.value === 'number' &&
-    /^score_/.test(f.label || '')
-  );
-  if (!scoreFields.length) return undefined;
-
   const map = {
     score_scroller: 'Scroller',
     score_binger: 'Binger',
@@ -178,11 +192,17 @@ function computeArchetypeFromScores(fields) {
     score_none: 'None'
   };
 
-  let best = null;
-  for (const f of scoreFields) {
-    const key = (f.label || '').toLowerCase();
-    if (!map[key]) continue;
-    if (!best || f.value > best.value) best = { label: map[key], value: f.value };
+  let bestKey = null;
+  let bestVal = -Infinity;
+
+  for (const f of fields) {
+    const label = (f.label || '').toLowerCase();
+    if (f.type === 'CALCULATED_FIELDS' && typeof f.value === 'number' && map[label]) {
+      if (f.value > bestVal) {
+        bestVal = f.value;
+        bestKey = label;
+      }
+    }
   }
-  return best?.label;
+  return bestKey ? map[bestKey] : undefined;
 }
